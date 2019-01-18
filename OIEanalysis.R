@@ -13,7 +13,6 @@ OIE<-OIE[!OIE$Cases%in%0,]
 OIE<-OIE[!is.na(OIE$Cases),]
 
 ##convert dates to readable format
-
 OIE$Latitude<-as.numeric(OIE$Latitude)
 OIE$Longitude<-as.numeric(OIE$Longitude)
 OIE$OBStartDate<-as.character(OIE$OBStartDate)
@@ -41,7 +40,6 @@ OIE$OBStartDate<-as.POSIXct(OIE$OBStartDate,format="%Y-%m-%d")
 OIE$OBEndDate<-as.POSIXct(OIE$OBEndDate,format="%Y-%m-%d")
 
 ##convert to spatial object
-
 coordinates(OIE) <- ~ Longitude + Latitude
 proj4string(OIE) <- "+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs"
 
@@ -66,8 +64,6 @@ OIE$LongDecimals[NULLlongs]<-NA
 
 rm(lengthlats, lengthlongs, NULLlats, NULLlongs)
 
-#coordinates(OIE)[1,1]-as.numeric(paste("0.", strrep("0",6),"5",sep=""))
-
 ##read in sequence IDs, KMLs and dates
 #seqinfo<-read.csv()
 seqinfo<-data.frame(2006,NA,NA)
@@ -75,7 +71,9 @@ colnames(seqinfo)<-c("Year","Month","Day")
 seqinfo$Code<-"BEL"
 seqinfo$Species<-"Cattle"
 
+##iterate through sequences
 for (i in 1:nrow(seqinfo)) {
+  lostprobability<-0
   KML<-readOGR("~/Desktop/Glasgow Work/KMLs/Belgium.kml","Belgium")
   
   ##test if points in known administrative region
@@ -142,7 +140,7 @@ for (i in 1:nrow(seqinfo)) {
   
   sppolygons<-list()
   
-  ##generate polygons
+  ##generate polygons adding the implicit uncertainty in the OIE records
   if (nrow(working)!=0) {
     for (j in 1:nrow(working)) {
       coordsmat<-matrix(NA,4,2)
@@ -186,48 +184,164 @@ for (i in 1:nrow(seqinfo)) {
       sppolygons[[j]]<-Polygons(list(Polygon(coordsmat)),j)
     }
     sppolygons<-SpatialPolygons(sppolygons)
+    ##give WGS84 CRS
     proj4string(sppolygons)<-CRS("+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0")
+    ##remove areas excluded from known administrative region
     sppolygons<-gIntersection(sppolygons,KML,byid = T)
   }
-}
+  
+  
+  ##generate probabilities - requires finessing when filtering by admin region removes polygons
+  prob<-working@data$Cases/sum(working@data$Cases)
+  ##change to equal area CRS - depends on input region
+  proj<-CRS("+proj=lcc +lat_1=49.83333333333334 +lat_2=51.16666666666666 +lat_0=50.797815 +lon_0=4.359215833333333 +x_0=649328 +y_0=665262 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs")
+  
+  sppolygons<-spTransform(sppolygons,proj)
+  
+  ##for testing purposes keep a record to minimise reruns
+  fortesting<-sppolygons
+  sppolygons<-fortesting
+  
+  ##initialise pointer and markers
+  marker1<-0
+  marker2<-0
+  i<-1
+  
+  ##while less than the length of the polygons object
+  while(i<length(sppolygons)) {
+    #search from the target for intersecting polygons
+    for (j in (i+1):length(sppolygons)) {
+      if (!is.null(gIntersection(sppolygons[i],sppolygons[j]))) {
+        ##if the intersection includes points and lines, as well as a polygon on the basis that two polygons that differ only 
+        ##by lines and points are equal from the probability perspective
+        if (class(gIntersection(sppolygons[i],sppolygons[j]))=="SpatialCollections") {
+          ##check for ring objects if present error out
+          if (!is.null(gIntersection(sppolygons[i],sppolygons[j])@polyobj)&!is.null(gIntersection(sppolygons[i],sppolygons[j])@ringobj)) {
+            stop("Ring object")
+          }
+          ##if no ring objects
+          if (!is.null(gIntersection(sppolygons[i],sppolygons[j])@polyobj)&is.null(gIntersection(sppolygons[i],sppolygons[j])@ringobj)) {
+            ##check area of intersection is not zero for safety
+            if (area(gIntersection(sppolygons[i],sppolygons[j])@polyobj)!=0) {
+              print(paste(i,j))
+              ##see if polygons are internal to one another
+              if (!is.null(gDifference(sppolygons[i],sppolygons[j]))) {
+                if (area(gDifference(sppolygons[i],sppolygons[j]))!=0) {
+                  marker1<-1
+                }
+              }
+              if (!is.null(gDifference(sppolygons[j],sppolygons[i]))) {
+                if (area(gDifference(sppolygons[j],sppolygons[i]))!=0) {
+                  marker2<-1
+                }
+              }
+              ##if implied equal
+              if (marker1==0&marker2==0) {
+                ##take the intersection
+                temp1<-gIntersection(sppolygons[i],sppolygons[j])@polyobj
+                ##record the areas
+                area1<-area(sppolygons[i])
+                area2<-area(sppolygons[j])
+                ##initialise object for new probabilities
+                workingprob1<-rep(NA,length(temp1@polygons[[1]]@Polygons))
 
-prob<-working@data$Cases/sum(working@data$Cases)
-proj<-CRS("+proj=lcc +lat_1=49.83333333333334 +lat_2=51.16666666666666 +lat_0=50.797815 +lon_0=4.359215833333333 +x_0=649328 +y_0=665262 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs")
+                ##initialise object for new polygons
+                bindingpolygons1<-list()
+                ##save new polygons and correct probability
+                for (q in 1:length(temp1@polygons[[1]]@Polygons)) {
+                  workingprob1[q]<-prob[i]*(temp1@polygons[[1]]@Polygons[[q]]@area/area1)+prob[j]*(temp1@polygons[[1]]@Polygons[[q]]@area/area2)
+                  bindingpolygons1[[q]]<-Polygons(list(temp1@polygons[[1]]@Polygons[[q]]),q)
+                }
+                bindingpolygons1<-SpatialPolygons(bindingpolygons1)
+                proj4string(bindingpolygons1)<-proj
 
-sppolygons<-spTransform(sppolygons,proj)
+                ##add probability to the list and remove original probabilities
+                prob<-c(prob,workingprob1)
+                prob<-prob[-c(i,j)]
 
-fortesting<-sppolygons
-sppolygons<-fortesting
-marker1<-0
-marker2<-0
-i<-1
-while(i<length(sppolygons)) {
-  for (j in (i+1):length(sppolygons)) {
-    if (!is.null(gIntersection(sppolygons[i],sppolygons[j]))) {
-      if (class(gIntersection(sppolygons[i],sppolygons[j]))=="SpatialCollections") {
-        if (!is.null(gIntersection(sppolygons[i],sppolygons[j])@polyobj)&!is.null(gIntersection(sppolygons[i],sppolygons[j])@ringobj)) { 
-          stop("Ring object")
+                ##add polygon to the list and remove original polygons
+                sppolygons<-c(sppolygons,bindingpolygons1)
+                sppolygons<-do.call(bind, sppolygons)
+                sppolygons<-SpatialPolygonsDataFrame(sppolygons,data.frame(q=c(1:length(sppolygons)),match.ID = F))
+                print(nrow(sppolygons))
+                sppolygons<-sppolygons[-c(i,j),]
+                print(nrow(sppolygons))
+                sppolygons<-SpatialPolygons(sppolygons@polygons,proj4string=sppolygons@proj4string)
+
+                ##reset iterator as polygon at i now different
+                i<-i-1
+              }
+
+              ##polygon validity checking
+              
+              ##record areas of all polygons
+              areas<-rep(NA,length(sppolygons))
+              for (m in 1:length(sppolygons)) {
+                areas[m]<-area(sppolygons[m])
+              }
+
+              ##subset out polygons with areas of less than 1m^2
+              sppolygons<-SpatialPolygonsDataFrame(sppolygons,data.frame(q=c(1:length(sppolygons))),match.ID = F)
+              sppolygons<-sppolygons[(areas>1),]
+              sppolygons<-SpatialPolygons(sppolygons@polygons,proj4string=sppolygons@proj4string)
+
+              ##subset out probabilities of polygons with areas of less than 1m^2 and record lost probability
+              lostprobability<-lostprobability+sum(prob[(areas<1)])
+              prob<-prob[(areas>1)]
+
+              ##find any polygons with invalid geometries
+              ######very very hacky - change
+              valid<-rep(T,length(sppolygons))
+              for (m in 1:length(sppolygons)) {
+                if (!gIsValid(sppolygons[m])) {
+                  valid[m]<-F
+                  print("Invalid geometry detected")
+                }
+              }
+
+              ##remove polygons with invalid geometries
+              sppolygons<-SpatialPolygonsDataFrame(sppolygons,data.frame(q=c(1:length(sppolygons))),match.ID = F)
+              sppolygons<-sppolygons[valid,]
+              sppolygons<-SpatialPolygons(sppolygons@polygons,proj4string=sppolygons@proj4string)
+
+              ##remove probabilites of polygons with invalid geometries and record lost probability
+              lostprobability<-lostprobability+sum(prob[!valid])
+              prob<-prob[valid]
+
+              ##break to next level
+              break()
+            }
+          }
         }
-        if (!is.null(gIntersection(sppolygons[i],sppolygons[j])@polyobj)&is.null(gIntersection(sppolygons[i],sppolygons[j])@ringobj)) {
-          if (area(gIntersection(sppolygons[i],sppolygons[j])@polyobj)!=0) {
+        ##if the intersection is just a polygon
+        if (class(gIntersection(sppolygons[i],sppolygons[j]))=="SpatialPolygons") {
+          ##check area of intersection is not zero for safety
+          if (area(gIntersection(sppolygons[i],sppolygons[j]))!=0) {
             print(paste(i,j))
+            ##see if polygons are internal to one another
             if (!is.null(gDifference(sppolygons[i],sppolygons[j]))) {
               if (area(gDifference(sppolygons[i],sppolygons[j]))!=0) {
                 marker1<-1
               }
-            }
+            }  
             if (!is.null(gDifference(sppolygons[j],sppolygons[i]))) {
               if (area(gDifference(sppolygons[j],sppolygons[i]))!=0) {
                 marker2<-1
               }
             }
+            ##if implied equal
             if (marker1==0&marker2==0) {
-              temp1<-gIntersection(sppolygons[i],sppolygons[j])@polyobj
+              ##take the intersection
+              temp1<-gIntersection(sppolygons[i],sppolygons[j])
+              ##record the areas
               area1<-area(sppolygons[i])
               area2<-area(sppolygons[j])
+              ##initialise object for new probabilities
               workingprob1<-rep(NA,length(temp1@polygons[[1]]@Polygons))
               
+              ##initialise object for new polygons
               bindingpolygons1<-list()
+              ##save new polygons and correct probability
               for (q in 1:length(temp1@polygons[[1]]@Polygons)) {
                 workingprob1[q]<-prob[i]*(temp1@polygons[[1]]@Polygons[[q]]@area/area1)+prob[j]*(temp1@polygons[[1]]@Polygons[[q]]@area/area2)
                 bindingpolygons1[[q]]<-Polygons(list(temp1@polygons[[1]]@Polygons[[q]]),q)
@@ -235,9 +349,11 @@ while(i<length(sppolygons)) {
               bindingpolygons1<-SpatialPolygons(bindingpolygons1)
               proj4string(bindingpolygons1)<-proj
               
+              ##add probability to the list and remove original probabilities
               prob<-c(prob,workingprob1)
               prob<-prob[-c(i,j)]
               
+              ##add polygon to the list and remove original polygons
               sppolygons<-c(sppolygons,bindingpolygons1)
               sppolygons<-do.call(bind, sppolygons)
               sppolygons<-SpatialPolygonsDataFrame(sppolygons,data.frame(q=c(1:length(sppolygons)),match.ID = F))
@@ -246,22 +362,29 @@ while(i<length(sppolygons)) {
               print(nrow(sppolygons))
               sppolygons<-SpatialPolygons(sppolygons@polygons,proj4string=sppolygons@proj4string)
               
+              ##reset iterator as polygon at i now different
               i<-i-1
             }
             
+            ##polygon validity checking
+            
+            ##record areas of all polygons
             areas<-rep(NA,length(sppolygons))
             for (m in 1:length(sppolygons)) {
               areas[m]<-area(sppolygons[m])
             }
             
+            ##subset out polygons with areas of less than 1m^2
             sppolygons<-SpatialPolygonsDataFrame(sppolygons,data.frame(q=c(1:length(sppolygons))),match.ID = F)
             sppolygons<-sppolygons[(areas>1),]
             sppolygons<-SpatialPolygons(sppolygons@polygons,proj4string=sppolygons@proj4string)
             
+            ##subset out probabilities of polygons with areas of less than 1m^2 and record lost probability
+            lostprobability<-lostprobability+sum(prob[(areas<1)])
             prob<-prob[(areas>1)]
             
+            ##find any polygons with invalid geometries
             ######very very hacky - change
-            
             valid<-rep(T,length(sppolygons))
             for (m in 1:length(sppolygons)) {
               if (!gIsValid(sppolygons[m])) {
@@ -270,117 +393,237 @@ while(i<length(sppolygons)) {
               }
             }
             
+            ##remove polygons with invalid geometries
             sppolygons<-SpatialPolygonsDataFrame(sppolygons,data.frame(q=c(1:length(sppolygons))),match.ID = F)
             sppolygons<-sppolygons[valid,]
             sppolygons<-SpatialPolygons(sppolygons@polygons,proj4string=sppolygons@proj4string)
             
+            ##remove probabilites of polygons with invalid geometries and record lost probability
+            lostprobability<-lostprobability+sum(prob[!valid])
             prob<-prob[valid]
             
+            ##break to next level
             break()
           }
         }
       }
-      if (class(gIntersection(sppolygons[i],sppolygons[j]))=="SpatialPolygons") {
-        if (area(gIntersection(sppolygons[i],sppolygons[j]))!=0) {
-          print(paste(i,j))
-          if (!is.null(gDifference(sppolygons[i],sppolygons[j]))) {
-            if (area(gDifference(sppolygons[i],sppolygons[j]))!=0) {
-              marker1<-1
-            }
-          }  
-          if (!is.null(gDifference(sppolygons[j],sppolygons[i]))) {
-            if (area(gDifference(sppolygons[j],sppolygons[i]))!=0) {
-              marker2<-1
-            }
-          }
-          ##if both have different regions
-          if (marker1==0&marker2==0) {
-            temp1<-gIntersection(sppolygons[i],sppolygons[j])
-            area1<-area(sppolygons[i])
-            area2<-area(sppolygons[j])
-            workingprob1<-rep(NA,length(temp1@polygons[[1]]@Polygons))
-            
-            bindingpolygons1<-list()
-            for (q in 1:length(temp1@polygons[[1]]@Polygons)) {
-              workingprob1[q]<-prob[i]*(temp1@polygons[[1]]@Polygons[[q]]@area/area1)+prob[j]*(temp1@polygons[[1]]@Polygons[[q]]@area/area2)
-              bindingpolygons1[[q]]<-Polygons(list(temp1@polygons[[1]]@Polygons[[q]]),q)
-            }
-            bindingpolygons1<-SpatialPolygons(bindingpolygons1)
-            proj4string(bindingpolygons1)<-proj
-            
-            prob<-c(prob,workingprob1)
-            prob<-prob[-c(i,j)]
-            
-            sppolygons<-c(sppolygons,bindingpolygons1)
-            sppolygons<-do.call(bind, sppolygons)
-            sppolygons<-SpatialPolygonsDataFrame(sppolygons,data.frame(q=c(1:length(sppolygons)),match.ID = F))
-            print(nrow(sppolygons))
-            sppolygons<-sppolygons[-c(i,j),]
-            print(nrow(sppolygons))
-            sppolygons<-SpatialPolygons(sppolygons@polygons,proj4string=sppolygons@proj4string)
-            
-            i<-i-1
-          }
-          
-          areas<-rep(NA,length(sppolygons))
-          for (m in 1:length(sppolygons)) {
-            areas[m]<-area(sppolygons[m])
-          }
-          
-          sppolygons<-SpatialPolygonsDataFrame(sppolygons,data.frame(q=c(1:length(sppolygons))),match.ID = F)
-          sppolygons<-sppolygons[(areas>1),]
-          sppolygons<-SpatialPolygons(sppolygons@polygons,proj4string=sppolygons@proj4string)
-          
-          prob<-prob[(areas>1)]
-          
-          ######very very hacky - change
-          
-          valid<-rep(T,length(sppolygons))
-          for (m in 1:length(sppolygons)) {
-            if (!gIsValid(sppolygons[m])) {
-              valid[m]<-F
-              print("Invalid geometry detected")
-            }
-          }
-          
-          sppolygons<-SpatialPolygonsDataFrame(sppolygons,data.frame(q=c(1:length(sppolygons))),match.ID = F)
-          sppolygons<-sppolygons[valid,]
-          sppolygons<-SpatialPolygons(sppolygons@polygons,proj4string=sppolygons@proj4string)
-          
-          prob<-prob[valid]
-          
-          break()
-        }
-      }
     }
+    ##reset markers update pointer
+    marker1<-0
+    marker2<-0
+    i<-i+1
   }
+  
+  
+  
+  fortesting<-sppolygons
+  sppolygons<-fortesting
   marker1<-0
   marker2<-0
-  i<-i+1
-}
-
-
-
-fortesting<-sppolygons
-sppolygons<-fortesting
-marker1<-0
-marker2<-0
-i<-1
-while(i<length(sppolygons)) {
-  for (j in (i+1):length(sppolygons)) {
-    if (!is.null(gIntersection(sppolygons[i],sppolygons[j]))) {
-      if (class(gIntersection(sppolygons[i],sppolygons[j]))=="SpatialCollections") {
-        if (!is.null(gIntersection(sppolygons[i],sppolygons[j])@polyobj)&!is.null(gIntersection(sppolygons[i],sppolygons[j])@ringobj)) { 
-          stop("Ring object")
+  i<-1
+  while(i<length(sppolygons)) {
+    for (j in (i+1):length(sppolygons)) {
+      if (!is.null(gIntersection(sppolygons[i],sppolygons[j]))) {
+        if (class(gIntersection(sppolygons[i],sppolygons[j]))=="SpatialCollections") {
+          if (!is.null(gIntersection(sppolygons[i],sppolygons[j])@polyobj)&!is.null(gIntersection(sppolygons[i],sppolygons[j])@ringobj)) { 
+            stop("Ring object")
+          }
+          if (!is.null(gIntersection(sppolygons[i],sppolygons[j])@polyobj)&is.null(gIntersection(sppolygons[i],sppolygons[j])@ringobj)) {
+            if (area(gIntersection(sppolygons[i],sppolygons[j])@polyobj)!=0) {
+              print(paste(i,j))
+              if (!is.null(gDifference(sppolygons[i],sppolygons[j]))) {
+                if (area(gDifference(sppolygons[i],sppolygons[j]))!=0) {
+                  marker1<-1
+                }
+              }
+              if (!is.null(gDifference(sppolygons[j],sppolygons[i]))) {
+                if (area(gDifference(sppolygons[j],sppolygons[i]))!=0) {
+                  marker2<-1
+                }
+              }
+              ##if both have different regions
+              if (marker1==1&marker2==1) {
+                print("Double difference")
+                temp1<-gDifference(sppolygons[i],sppolygons[j])
+                temp2<-gDifference(sppolygons[j],sppolygons[i])
+                temp3<-gIntersection(sppolygons[i],sppolygons[j])@polyobj
+                area1<-area(sppolygons[i])
+                area2<-area(sppolygons[j])
+                workingprob1<-rep(NA,length(temp1@polygons[[1]]@Polygons))
+                workingprob2<-rep(NA,length(temp2@polygons[[1]]@Polygons))
+                workingprob3<-rep(NA,length(temp3@polygons[[1]]@Polygons))
+                
+                bindingpolygons1<-list()
+                for (q in 1:length(temp1@polygons[[1]]@Polygons)) {
+                  workingprob1[q]<-prob[i]*(temp1@polygons[[1]]@Polygons[[q]]@area/area1)
+                  bindingpolygons1[[q]]<-Polygons(list(temp1@polygons[[1]]@Polygons[[q]]),q)
+                }
+                bindingpolygons1<-SpatialPolygons(bindingpolygons1)
+                proj4string(bindingpolygons1)<-proj
+                
+                bindingpolygons2<-list()
+                for (q in 1:length(temp2@polygons[[1]]@Polygons)) {
+                  workingprob2[q]<-prob[j]*(temp2@polygons[[1]]@Polygons[[q]]@area/area2)
+                  bindingpolygons2[[q]]<-Polygons(list(temp2@polygons[[1]]@Polygons[[q]]),q)
+                }
+                bindingpolygons2<-SpatialPolygons(bindingpolygons2)
+                proj4string(bindingpolygons2)<-proj
+                
+                bindingpolygons3<-list()
+                for (q in 1:length(temp3@polygons[[1]]@Polygons)) {
+                  workingprob3[q]<-prob[i]*(temp3@polygons[[1]]@Polygons[[q]]@area/area1)+prob[j]*(temp3@polygons[[1]]@Polygons[[q]]@area/area2)
+                  bindingpolygons3[[q]]<-Polygons(list(temp3@polygons[[1]]@Polygons[[q]]),q)
+                }
+                bindingpolygons3<-SpatialPolygons(bindingpolygons3)
+                proj4string(bindingpolygons3)<-proj
+                
+                prob<-c(prob,workingprob1,workingprob2,workingprob3)
+                prob<-prob[-c(i,j)]
+                
+                sppolygons<-c(sppolygons,bindingpolygons1,bindingpolygons2,bindingpolygons3)
+                sppolygons<-do.call(bind, sppolygons)
+                sppolygons<-SpatialPolygonsDataFrame(sppolygons,data.frame(q=c(1:length(sppolygons)),match.ID = F))
+                print(length(sppolygons))
+                sppolygons<-sppolygons[-c(i,j),]
+                print(length(sppolygons))
+                sppolygons<-SpatialPolygons(sppolygons@polygons,proj4string=sppolygons@proj4string)
+                ##if j inside i
+              } else if (marker1==1&marker2==0) {
+                print("A difference")
+                temp1<-gDifference(sppolygons[i],sppolygons[j])
+                temp2<-gIntersection(sppolygons[i],sppolygons[j])@polyobj
+                area1<-area(sppolygons[i])
+                area2<-area(sppolygons[j])
+                workingprob1<-rep(NA,length(temp1@polygons[[1]]@Polygons))
+                workingprob2<-rep(NA,length(temp2@polygons[[1]]@Polygons))
+                
+                bindingpolygons1<-list()
+                for (q in 1:length(temp1@polygons[[1]]@Polygons)) {
+                  workingprob1[q]<-prob[i]*(temp1@polygons[[1]]@Polygons[[q]]@area/area1)
+                  bindingpolygons1[[q]]<-Polygons(list(temp1@polygons[[1]]@Polygons[[q]]),q)
+                }
+                bindingpolygons1<-SpatialPolygons(bindingpolygons1)
+                proj4string(bindingpolygons1)<-proj
+                
+                bindingpolygons2<-list()
+                for (q in 1:length(temp2@polygons[[1]]@Polygons)) {
+                  workingprob2[q]<-prob[i]*(temp2@polygons[[1]]@Polygons[[q]]@area/area1)+prob[j]*(temp2@polygons[[1]]@Polygons[[q]]@area/area2)
+                  bindingpolygons2[[q]]<-Polygons(list(temp2@polygons[[1]]@Polygons[[q]]),q)
+                }
+                bindingpolygons2<-SpatialPolygons(bindingpolygons2)
+                proj4string(bindingpolygons2)<-proj
+                
+                prob<-c(prob,workingprob1,workingprob2)
+                prob<-prob[-c(i,j)]
+                
+                sppolygons<-c(sppolygons,bindingpolygons1,bindingpolygons2)
+                sppolygons<-do.call(bind, sppolygons)
+                sppolygons<-SpatialPolygonsDataFrame(sppolygons,data.frame(q=c(1:length(sppolygons)),match.ID = F))
+                print(length(sppolygons))
+                sppolygons<-sppolygons[-c(i,j),]
+                print(length(sppolygons))
+                sppolygons<-SpatialPolygons(sppolygons@polygons,proj4string=sppolygons@proj4string)
+                ##if i inside j
+              } else if (marker1==0&marker2==1) {
+                print("B difference")
+                temp1<-gDifference(sppolygons[j],sppolygons[i])
+                temp2<-gIntersection(sppolygons[i],sppolygons[j])@polyobj
+                area1<-area(sppolygons[j])
+                area2<-area(sppolygons[i])
+                workingprob1<-rep(NA,length(temp1@polygons[[1]]@Polygons))
+                workingprob2<-rep(NA,length(temp2@polygons[[1]]@Polygons))
+                
+                bindingpolygons1<-list()
+                for (q in 1:length(temp1@polygons[[1]]@Polygons)) {
+                  workingprob1[q]<-prob[j]*(temp1@polygons[[1]]@Polygons[[q]]@area/area1)
+                  bindingpolygons1[[q]]<-Polygons(list(temp1@polygons[[1]]@Polygons[[q]]),q)
+                }
+                bindingpolygons1<-SpatialPolygons(bindingpolygons1)
+                proj4string(bindingpolygons1)<-proj
+                
+                bindingpolygons2<-list()
+                for (q in 1:length(temp2@polygons[[1]]@Polygons)) {
+                  workingprob2[q]<-prob[j]*(temp2@polygons[[1]]@Polygons[[q]]@area/area1)+prob[i]*(temp2@polygons[[1]]@Polygons[[q]]@area/area2)
+                  bindingpolygons2[[q]]<-Polygons(list(temp2@polygons[[1]]@Polygons[[q]]),q)
+                }
+                bindingpolygons2<-SpatialPolygons(bindingpolygons2)
+                proj4string(bindingpolygons2)<-proj
+                
+                prob<-c(prob,workingprob1,workingprob2)
+                prob<-prob[-c(i,j)]
+                
+                sppolygons<-c(sppolygons,bindingpolygons1,bindingpolygons2)
+                sppolygons<-do.call(bind, sppolygons)
+                sppolygons<-SpatialPolygonsDataFrame(sppolygons,data.frame(q=c(1:length(sppolygons)),match.ID = F))
+                print(length(sppolygons))
+                sppolygons<-sppolygons[-c(i,j),]
+                print(length(sppolygons))
+                sppolygons<-SpatialPolygons(sppolygons@polygons,proj4string=sppolygons@proj4string)
+              } else {
+                print("Equal")
+                temp1<-gIntersection(sppolygons[i],sppolygons[j])@polyobj
+                area1<-area(sppolygons[i])
+                area2<-area(sppolygons[j])
+                workingprob1<-rep(NA,length(temp1@polygons[[1]]@Polygons))
+                
+                bindingpolygons1<-list()
+                for (q in 1:length(temp1@polygons[[1]]@Polygons)) {
+                  workingprob1[q]<-prob[i]*(temp1@polygons[[1]]@Polygons[[q]]@area/area1)+prob[j]*(temp1@polygons[[1]]@Polygons[[q]]@area/area2)
+                  bindingpolygons1[[q]]<-Polygons(list(temp1@polygons[[1]]@Polygons[[q]]),q)
+                }
+                bindingpolygons1<-SpatialPolygons(bindingpolygons1)
+                proj4string(bindingpolygons1)<-proj
+                
+                prob<-c(prob,workingprob1)
+                prob<-prob[-c(i,j)]
+                
+                sppolygons<-c(sppolygons,bindingpolygons1)
+                sppolygons<-do.call(bind, sppolygons)
+                sppolygons<-SpatialPolygonsDataFrame(sppolygons,data.frame(q=c(1:length(sppolygons)),match.ID = F))
+                sppolygons<-sppolygons[-c(i,j),]
+                sppolygons<-SpatialPolygons(sppolygons@polygons,proj4string=sppolygons@proj4string)
+              }
+              
+              areas<-rep(NA,length(sppolygons))
+              for (m in 1:length(sppolygons)) {
+                areas[m]<-area(sppolygons[m])
+              }
+              
+              sppolygons<-SpatialPolygonsDataFrame(sppolygons,data.frame(q=c(1:length(sppolygons))),match.ID = F)
+              sppolygons<-sppolygons[(areas>1),]
+              sppolygons<-SpatialPolygons(sppolygons@polygons,proj4string=sppolygons@proj4string)
+              
+              prob<-prob[(areas>1)]
+              
+              ######very very hacky - change
+              
+              valid<-rep(T,length(sppolygons))
+              for (m in 1:length(sppolygons)) {
+                if (!gIsValid(sppolygons[m])) {
+                  valid[m]<-F
+                  print("Invalid geometry detected")
+                }
+              }
+              
+              sppolygons<-SpatialPolygonsDataFrame(sppolygons,data.frame(q=c(1:length(sppolygons))),match.ID = F)
+              sppolygons<-sppolygons[valid,]
+              sppolygons<-SpatialPolygons(sppolygons@polygons,proj4string=sppolygons@proj4string)
+              
+              prob<-prob[valid]
+              
+              i<-i-1
+              break()
+            }
+          }
         }
-        if (!is.null(gIntersection(sppolygons[i],sppolygons[j])@polyobj)&is.null(gIntersection(sppolygons[i],sppolygons[j])@ringobj)) {
-          if (area(gIntersection(sppolygons[i],sppolygons[j])@polyobj)!=0) {
+        if (class(gIntersection(sppolygons[i],sppolygons[j]))=="SpatialPolygons") {
+          if (area(gIntersection(sppolygons[i],sppolygons[j]))!=0) {
             print(paste(i,j))
             if (!is.null(gDifference(sppolygons[i],sppolygons[j]))) {
               if (area(gDifference(sppolygons[i],sppolygons[j]))!=0) {
                 marker1<-1
               }
-            }
+            }  
             if (!is.null(gDifference(sppolygons[j],sppolygons[i]))) {
               if (area(gDifference(sppolygons[j],sppolygons[i]))!=0) {
                 marker2<-1
@@ -391,7 +634,7 @@ while(i<length(sppolygons)) {
               print("Double difference")
               temp1<-gDifference(sppolygons[i],sppolygons[j])
               temp2<-gDifference(sppolygons[j],sppolygons[i])
-              temp3<-gIntersection(sppolygons[i],sppolygons[j])@polyobj
+              temp3<-gIntersection(sppolygons[i],sppolygons[j])
               area1<-area(sppolygons[i])
               area2<-area(sppolygons[j])
               workingprob1<-rep(NA,length(temp1@polygons[[1]]@Polygons))
@@ -427,7 +670,7 @@ while(i<length(sppolygons)) {
               
               sppolygons<-c(sppolygons,bindingpolygons1,bindingpolygons2,bindingpolygons3)
               sppolygons<-do.call(bind, sppolygons)
-              sppolygons<-SpatialPolygonsDataFrame(sppolygons,data.frame(q=c(1:length(sppolygons)),match.ID = F))
+              sppolygons<-SpatialPolygonsDataFrame(sppolygons,data.frame(q=c(1:length(sppolygons))),match.ID = F)
               print(length(sppolygons))
               sppolygons<-sppolygons[-c(i,j),]
               print(length(sppolygons))
@@ -436,7 +679,7 @@ while(i<length(sppolygons)) {
             } else if (marker1==1&marker2==0) {
               print("A difference")
               temp1<-gDifference(sppolygons[i],sppolygons[j])
-              temp2<-gIntersection(sppolygons[i],sppolygons[j])@polyobj
+              temp2<-gIntersection(sppolygons[i],sppolygons[j])
               area1<-area(sppolygons[i])
               area2<-area(sppolygons[j])
               workingprob1<-rep(NA,length(temp1@polygons[[1]]@Polygons))
@@ -472,7 +715,7 @@ while(i<length(sppolygons)) {
             } else if (marker1==0&marker2==1) {
               print("B difference")
               temp1<-gDifference(sppolygons[j],sppolygons[i])
-              temp2<-gIntersection(sppolygons[i],sppolygons[j])@polyobj
+              temp2<-gIntersection(sppolygons[i],sppolygons[j])
               area1<-area(sppolygons[j])
               area2<-area(sppolygons[i])
               workingprob1<-rep(NA,length(temp1@polygons[[1]]@Polygons))
@@ -506,7 +749,7 @@ while(i<length(sppolygons)) {
               sppolygons<-SpatialPolygons(sppolygons@polygons,proj4string=sppolygons@proj4string)
             } else {
               print("Equal")
-              temp1<-gIntersection(sppolygons[i],sppolygons[j])@polyobj
+              temp1<-gIntersection(sppolygons[i],sppolygons[j])
               area1<-area(sppolygons[i])
               area2<-area(sppolygons[j])
               workingprob1<-rep(NA,length(temp1@polygons[[1]]@Polygons))
@@ -525,7 +768,9 @@ while(i<length(sppolygons)) {
               sppolygons<-c(sppolygons,bindingpolygons1)
               sppolygons<-do.call(bind, sppolygons)
               sppolygons<-SpatialPolygonsDataFrame(sppolygons,data.frame(q=c(1:length(sppolygons)),match.ID = F))
+              print(length(sppolygons))
               sppolygons<-sppolygons[-c(i,j),]
+              print(length(sppolygons))
               sppolygons<-SpatialPolygons(sppolygons@polygons,proj4string=sppolygons@proj4string)
             }
             
@@ -561,198 +806,9 @@ while(i<length(sppolygons)) {
           }
         }
       }
-      if (class(gIntersection(sppolygons[i],sppolygons[j]))=="SpatialPolygons") {
-        if (area(gIntersection(sppolygons[i],sppolygons[j]))!=0) {
-          print(paste(i,j))
-          if (!is.null(gDifference(sppolygons[i],sppolygons[j]))) {
-            if (area(gDifference(sppolygons[i],sppolygons[j]))!=0) {
-              marker1<-1
-            }
-          }  
-          if (!is.null(gDifference(sppolygons[j],sppolygons[i]))) {
-            if (area(gDifference(sppolygons[j],sppolygons[i]))!=0) {
-              marker2<-1
-            }
-          }
-          ##if both have different regions
-          if (marker1==1&marker2==1) {
-            print("Double difference")
-            temp1<-gDifference(sppolygons[i],sppolygons[j])
-            temp2<-gDifference(sppolygons[j],sppolygons[i])
-            temp3<-gIntersection(sppolygons[i],sppolygons[j])
-            area1<-area(sppolygons[i])
-            area2<-area(sppolygons[j])
-            workingprob1<-rep(NA,length(temp1@polygons[[1]]@Polygons))
-            workingprob2<-rep(NA,length(temp2@polygons[[1]]@Polygons))
-            workingprob3<-rep(NA,length(temp3@polygons[[1]]@Polygons))
-            
-            bindingpolygons1<-list()
-            for (q in 1:length(temp1@polygons[[1]]@Polygons)) {
-              workingprob1[q]<-prob[i]*(temp1@polygons[[1]]@Polygons[[q]]@area/area1)
-              bindingpolygons1[[q]]<-Polygons(list(temp1@polygons[[1]]@Polygons[[q]]),q)
-            }
-            bindingpolygons1<-SpatialPolygons(bindingpolygons1)
-            proj4string(bindingpolygons1)<-proj
-            
-            bindingpolygons2<-list()
-            for (q in 1:length(temp2@polygons[[1]]@Polygons)) {
-              workingprob2[q]<-prob[j]*(temp2@polygons[[1]]@Polygons[[q]]@area/area2)
-              bindingpolygons2[[q]]<-Polygons(list(temp2@polygons[[1]]@Polygons[[q]]),q)
-            }
-            bindingpolygons2<-SpatialPolygons(bindingpolygons2)
-            proj4string(bindingpolygons2)<-proj
-            
-            bindingpolygons3<-list()
-            for (q in 1:length(temp3@polygons[[1]]@Polygons)) {
-              workingprob3[q]<-prob[i]*(temp3@polygons[[1]]@Polygons[[q]]@area/area1)+prob[j]*(temp3@polygons[[1]]@Polygons[[q]]@area/area2)
-              bindingpolygons3[[q]]<-Polygons(list(temp3@polygons[[1]]@Polygons[[q]]),q)
-            }
-            bindingpolygons3<-SpatialPolygons(bindingpolygons3)
-            proj4string(bindingpolygons3)<-proj
-            
-            prob<-c(prob,workingprob1,workingprob2,workingprob3)
-            prob<-prob[-c(i,j)]
-            
-            sppolygons<-c(sppolygons,bindingpolygons1,bindingpolygons2,bindingpolygons3)
-            sppolygons<-do.call(bind, sppolygons)
-            sppolygons<-SpatialPolygonsDataFrame(sppolygons,data.frame(q=c(1:length(sppolygons))),match.ID = F)
-            print(length(sppolygons))
-            sppolygons<-sppolygons[-c(i,j),]
-            print(length(sppolygons))
-            sppolygons<-SpatialPolygons(sppolygons@polygons,proj4string=sppolygons@proj4string)
-            ##if j inside i
-          } else if (marker1==1&marker2==0) {
-            print("A difference")
-            temp1<-gDifference(sppolygons[i],sppolygons[j])
-            temp2<-gIntersection(sppolygons[i],sppolygons[j])
-            area1<-area(sppolygons[i])
-            area2<-area(sppolygons[j])
-            workingprob1<-rep(NA,length(temp1@polygons[[1]]@Polygons))
-            workingprob2<-rep(NA,length(temp2@polygons[[1]]@Polygons))
-            
-            bindingpolygons1<-list()
-            for (q in 1:length(temp1@polygons[[1]]@Polygons)) {
-              workingprob1[q]<-prob[i]*(temp1@polygons[[1]]@Polygons[[q]]@area/area1)
-              bindingpolygons1[[q]]<-Polygons(list(temp1@polygons[[1]]@Polygons[[q]]),q)
-            }
-            bindingpolygons1<-SpatialPolygons(bindingpolygons1)
-            proj4string(bindingpolygons1)<-proj
-            
-            bindingpolygons2<-list()
-            for (q in 1:length(temp2@polygons[[1]]@Polygons)) {
-              workingprob2[q]<-prob[i]*(temp2@polygons[[1]]@Polygons[[q]]@area/area1)+prob[j]*(temp2@polygons[[1]]@Polygons[[q]]@area/area2)
-              bindingpolygons2[[q]]<-Polygons(list(temp2@polygons[[1]]@Polygons[[q]]),q)
-            }
-            bindingpolygons2<-SpatialPolygons(bindingpolygons2)
-            proj4string(bindingpolygons2)<-proj
-            
-            prob<-c(prob,workingprob1,workingprob2)
-            prob<-prob[-c(i,j)]
-            
-            sppolygons<-c(sppolygons,bindingpolygons1,bindingpolygons2)
-            sppolygons<-do.call(bind, sppolygons)
-            sppolygons<-SpatialPolygonsDataFrame(sppolygons,data.frame(q=c(1:length(sppolygons)),match.ID = F))
-            print(length(sppolygons))
-            sppolygons<-sppolygons[-c(i,j),]
-            print(length(sppolygons))
-            sppolygons<-SpatialPolygons(sppolygons@polygons,proj4string=sppolygons@proj4string)
-            ##if i inside j
-          } else if (marker1==0&marker2==1) {
-            print("B difference")
-            temp1<-gDifference(sppolygons[j],sppolygons[i])
-            temp2<-gIntersection(sppolygons[i],sppolygons[j])
-            area1<-area(sppolygons[j])
-            area2<-area(sppolygons[i])
-            workingprob1<-rep(NA,length(temp1@polygons[[1]]@Polygons))
-            workingprob2<-rep(NA,length(temp2@polygons[[1]]@Polygons))
-            
-            bindingpolygons1<-list()
-            for (q in 1:length(temp1@polygons[[1]]@Polygons)) {
-              workingprob1[q]<-prob[j]*(temp1@polygons[[1]]@Polygons[[q]]@area/area1)
-              bindingpolygons1[[q]]<-Polygons(list(temp1@polygons[[1]]@Polygons[[q]]),q)
-            }
-            bindingpolygons1<-SpatialPolygons(bindingpolygons1)
-            proj4string(bindingpolygons1)<-proj
-            
-            bindingpolygons2<-list()
-            for (q in 1:length(temp2@polygons[[1]]@Polygons)) {
-              workingprob2[q]<-prob[j]*(temp2@polygons[[1]]@Polygons[[q]]@area/area1)+prob[i]*(temp2@polygons[[1]]@Polygons[[q]]@area/area2)
-              bindingpolygons2[[q]]<-Polygons(list(temp2@polygons[[1]]@Polygons[[q]]),q)
-            }
-            bindingpolygons2<-SpatialPolygons(bindingpolygons2)
-            proj4string(bindingpolygons2)<-proj
-            
-            prob<-c(prob,workingprob1,workingprob2)
-            prob<-prob[-c(i,j)]
-            
-            sppolygons<-c(sppolygons,bindingpolygons1,bindingpolygons2)
-            sppolygons<-do.call(bind, sppolygons)
-            sppolygons<-SpatialPolygonsDataFrame(sppolygons,data.frame(q=c(1:length(sppolygons)),match.ID = F))
-            print(length(sppolygons))
-            sppolygons<-sppolygons[-c(i,j),]
-            print(length(sppolygons))
-            sppolygons<-SpatialPolygons(sppolygons@polygons,proj4string=sppolygons@proj4string)
-          } else {
-            print("Equal")
-            temp1<-gIntersection(sppolygons[i],sppolygons[j])
-            area1<-area(sppolygons[i])
-            area2<-area(sppolygons[j])
-            workingprob1<-rep(NA,length(temp1@polygons[[1]]@Polygons))
-            
-            bindingpolygons1<-list()
-            for (q in 1:length(temp1@polygons[[1]]@Polygons)) {
-              workingprob1[q]<-prob[i]*(temp1@polygons[[1]]@Polygons[[q]]@area/area1)+prob[j]*(temp1@polygons[[1]]@Polygons[[q]]@area/area2)
-              bindingpolygons1[[q]]<-Polygons(list(temp1@polygons[[1]]@Polygons[[q]]),q)
-            }
-            bindingpolygons1<-SpatialPolygons(bindingpolygons1)
-            proj4string(bindingpolygons1)<-proj
-            
-            prob<-c(prob,workingprob1)
-            prob<-prob[-c(i,j)]
-            
-            sppolygons<-c(sppolygons,bindingpolygons1)
-            sppolygons<-do.call(bind, sppolygons)
-            sppolygons<-SpatialPolygonsDataFrame(sppolygons,data.frame(q=c(1:length(sppolygons)),match.ID = F))
-            print(length(sppolygons))
-            sppolygons<-sppolygons[-c(i,j),]
-            print(length(sppolygons))
-            sppolygons<-SpatialPolygons(sppolygons@polygons,proj4string=sppolygons@proj4string)
-          }
-          
-          areas<-rep(NA,length(sppolygons))
-          for (m in 1:length(sppolygons)) {
-            areas[m]<-area(sppolygons[m])
-          }
-          
-          sppolygons<-SpatialPolygonsDataFrame(sppolygons,data.frame(q=c(1:length(sppolygons))),match.ID = F)
-          sppolygons<-sppolygons[(areas>1),]
-          sppolygons<-SpatialPolygons(sppolygons@polygons,proj4string=sppolygons@proj4string)
-          
-          prob<-prob[(areas>1)]
-          
-          ######very very hacky - change
-          
-          valid<-rep(T,length(sppolygons))
-          for (m in 1:length(sppolygons)) {
-            if (!gIsValid(sppolygons[m])) {
-              valid[m]<-F
-              print("Invalid geometry detected")
-            }
-          }
-          
-          sppolygons<-SpatialPolygonsDataFrame(sppolygons,data.frame(q=c(1:length(sppolygons))),match.ID = F)
-          sppolygons<-sppolygons[valid,]
-          sppolygons<-SpatialPolygons(sppolygons@polygons,proj4string=sppolygons@proj4string)
-          
-          prob<-prob[valid]
-          
-          i<-i-1
-          break()
-        }
-      }
     }
+    marker1<-0
+    marker2<-0
+    i<-i+1
   }
-  marker1<-0
-  marker2<-0
-  i<-i+1
 }

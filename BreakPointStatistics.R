@@ -10,18 +10,20 @@ library(lwgeom)
 library(geosphere)
 library(lubridate)
 
+##read in sequences
+
 OIE<-read.csv("~/Desktop/OIEdatasetforcovariate.csv")[,c(4,5,7,8,10,11,12,14)]
 OIE<-OIE[!OIE$Cases%in%0,]
 OIE<-OIE[!is.na(OIE$Cases),]
 
-##convert dates to readable format
-
-##convert dates to readable format
+##convert to correct factors
 
 OIE$Latitude<-as.numeric(OIE$Latitude)
 OIE$Longitude<-as.numeric(OIE$Longitude)
 OIE$OBStartDate<-as.character(OIE$OBStartDate)
 OIE$OBEndDate<-as.character(OIE$OBEndDate)
+
+##convert dates to readable format
 
 OIEreduced<-OIE[OIE$OBEndDate=="",]
 OIE<-OIE[OIE$OBEndDate!="",]
