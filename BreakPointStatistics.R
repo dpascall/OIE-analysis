@@ -84,9 +84,9 @@ colnames(datesforsearch)<-c("mid","start","end")
 datesforsearch$mid<-datesforsearch$start+floor((datesforsearch$end-datesforsearch$start)/2)
 datesforsearch$mid<-as.POSIXct(datesforsearch$mid,format="%Y-%m-%d")
 
-lat<-rep(NA,nrow(seqinfo))
-long<-rep(NA,nrow(seqinfo))
-count<-rep(0,nrow(seqinfo))
+lat<-rep(NA,nrow(datesforsearch))
+long<-rep(NA,nrow(datesforsearch))
+count<-rep(0,nrow(datesforsearch))
 
 for (i in 1:(nrow(datesforsearch)-1)) {
   ##test if points in known administrative region
@@ -236,4 +236,3 @@ final$daylength<-daylength(final$lat,final$mid)
 final$start<-date_decimal(final$start)
 final$end<-decimal_date(final$end)
 
-write.csv(final,"~/Desktop/covariatelocations.csv",row.names = F)

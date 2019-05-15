@@ -10,31 +10,31 @@ library(lwgeom)
 
 recursivesimplify<-function (x) {
   ##start pointer
-  i<-1
+  b<-1
   ##save temporary variable
   target<-x
-  while (i<=nrow(target)) {
+  while (b<=nrow(target)) {
     ##if the geometry if MULTIPOLYGON cast to polygon
-    if (class(target$geometry[i])[1]=="sfc_MULTIPOLYGON") {
+    if (class(target$geometry[b])[1]=="sfc_MULTIPOLYGON") {
       ##join
-      target<-rbind(target,st_cast(target[i,],"POLYGON"))
+      target<-rbind(target,st_cast(target[b,],"POLYGON"))
       ##remove original
-      target<-target[-i,]
-      i<-i-1
+      target<-target[-b,]
+      b<-b-1
     }
     ##if the geometry if GEOMETRYCOLLECTION cast to separate can call function recursively again
-    if (class(target$geometry[i])[1]=="sfc_GEOMETRYCOLLECTION") {
-      temp<-st_cast(target[i,])
+    if (class(target$geometry[b])[1]=="sfc_GEOMETRYCOLLECTION") {
+      temp<-st_cast(target[b,])
       ##remove area 0 area geometries
       temp<-temp[as.numeric(st_area(temp))!=0,]
       temp<-recursivesimplify(temp)
       #join
       target<-rbind(target,temp)
       #remove original
-      target<-target[-i,]
-      i<-i-1
+      target<-target[-b,]
+      b<-b-1
     }
-    i<-i+1
+    b<-b+1
   }
   ##return temporary variable
   target<-target[as.numeric(st_area(target))!=0,]
@@ -98,16 +98,15 @@ OIE$LongDecimals[NULLlongs]<-NA
 rm(lengthlats, lengthlongs, NULLlats, NULLlongs)
 
 ##read in sequence IDs, KMLs and dates
-#seqinfo<-read.csv()
-seqinfo<-data.frame(2006,NA,NA)
-colnames(seqinfo)<-c("Year","Month","Day")
-seqinfo$Code<-"BEL"
-seqinfo$Species<-"Cattle"
+seqinfo<-read.csv("~/Dropbox/BTV-8/KMLgenerator.csv",stringsAsFactors=F)
 
 ##iterate through sequences
 for (i in 1:nrow(seqinfo)) {
   lostprobability<-0
-  KML<-readOGR("~/Desktop/Glasgow Work/KMLs/Belgium.kml","Belgium")
+  KML<-st_zm(read_sf(paste("~/Desktop/Glasgow Work/KMLs/",seqinfo$KML[i],sep=""),strsplit(seqinfo$KML[i],".kml")[[1]][1]))
+  proj<-CRS("+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0")
+  eqproj<-CRS(seqinfo$Projection[i])
+  eqproj4<-seqinfo$Projection[i]
   
   ##test if points in known administrative region
   working<-OIE
@@ -163,13 +162,14 @@ for (i in 1:nrow(seqinfo)) {
   }
   
   ##filter on country
-  #working<-working[as.character(working$Code)%in%as.character(seqinfo$Code),]
-  working<-working[as.character(working$Code)%in%"BEL",]
+  working<-working[as.character(working$Code)%in%as.character(seqinfo$Code[i]),]
   
   ##filter on species where possible
   if (!is.na(seqinfo$Species[i])) {
     working<-working[grep(as.character(seqinfo$Species[i]),as.character(working$Species),ignore.case = T),]
   }
+  
+  print(working)
   
   sppolygons<-list()
   
@@ -220,58 +220,171 @@ for (i in 1:nrow(seqinfo)) {
     ##give WGS84 CRS
     proj4string(sppolygons)<-CRS("+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0")
     ##remove areas excluded from known administrative region
-    sppolygons<-gIntersection(sppolygons,KML,byid = T)
+  
+  ##calculate corrections for probabilities - because trimmed areas do not give the same probability that a case is in an area as is the case before trimming
+  
+  ##get raw probabilities
+  prob<-working@data$Cases/sum(working@data$Cases)
+  ##project generated polygons and KML to equal area projection
+  probsfpolygons<-st_make_valid(st_as_sf(spTransform(sppolygons,eqproj)))
+  probKML<-st_transform(KML,eqproj4)
+  
+  ##if not spatial polygons convert
+  if (sum(!do.call("rbind",lapply(probKML$geometry, class))[,2]%in%c("POLYGON","MULTIPOLYGON"))!=0) {
+    probKML<-st_polygonize(probKML)
+    KML<-as(probKML, "Spatial")
+    KML<-spTransform(KML,proj)
   }
-}
-
-proj<-CRS("+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0")
-
-##generate probabilities - requires finessing when filtering by admin region removes polygons
-prob<-working@data$Cases/sum(working@data$Cases)
-
-##for testing purposes keep a record to minimise reruns
-fortesting<-sppolygons
-sppolygons<-fortesting
-
-##initialise pointer and markers
-marker1<-0
-marker2<-0
-i<-1
-
-##while less than the length of the polygons object
-while(i<length(sppolygons)) {
-  #search from the target for intersecting polygons
-  for (j in (i+1):length(sppolygons)) {
-    if (!is.null(gIntersection(sppolygons[i],sppolygons[j]))) {
-      ##if the intersection includes points and lines, as well as a polygon on the basis that two polygons that differ only 
-      ##by lines and points are equal from the probability perspective
-      if (class(gIntersection(sppolygons[i],sppolygons[j]))=="SpatialCollections") {
-        ##check for ring objects if present error out
-        if (!is.null(gIntersection(sppolygons[i],sppolygons[j])@polyobj)&!is.null(gIntersection(sppolygons[i],sppolygons[j])@ringobj)) {
-          stop("Ring object")
+  
+  ##give polygons IDs for tracking purposes
+  probsfpolygons$ID<-c(1:nrow(probsfpolygons))
+  ##intersect polygons with KML, removing those outside of the region trimming those inside
+  probsfpolygonsreduced<-st_intersection(probsfpolygons,probKML)
+  ##if no intersecting polygons - break loop 
+  if (nrow(probsfpolygonsreduced)==0) {
+    sink(file=paste("~/Desktop/TestKMLs/",seqinfo$Sequence[i],".kml",sep=""))
+    cat("No cases consistent with this metadata."); cat("\n")
+    sink(NULL)
+    next()
+  }
+  ##delete probabilies of polygons removed
+  prob<-prob[probsfpolygonsreduced$ID]
+  ##for each remaining polygon, test if area differs after intersection with KML and calculate correction factor
+  for (u in 1:nrow(probsfpolygonsreduced)) {
+    oriarea<-as.numeric(st_area(probsfpolygons[probsfpolygons$ID==probsfpolygonsreduced$ID[u],]))
+    newarea<-as.numeric(st_area(probsfpolygonsreduced[u,]))
+    if (oriarea>newarea) {
+      prob[u]<-prob[u]*(newarea/oriarea)
+    }
+  }
+  ##rescale probabilities post correction
+  prob<-prob/sum(prob)
+  
+  #sppolygons<-gIntersection(sppolygons,KML,byid = T,checkValidity = T)
+  sppolygons<-spTransform(as(probsfpolygonsreduced, "Spatial"),proj)
+  
+  ##initialise pointer and markers
+  marker1<-0
+  marker2<-0
+  u<-1
+  
+  ##while less than the length of the polygons object
+  while(u<length(sppolygons)) {
+    #search from the target for intersecting polygons
+    for (j in (u+1):length(sppolygons)) {
+      if (!is.null(gIntersection(sppolygons[u],sppolygons[j]))) {
+        ##if the intersection includes points and lines, as well as a polygon on the basis that two polygons that differ only 
+        ##by lines and points are equal from the probability perspective
+        if (class(gIntersection(sppolygons[u],sppolygons[j]))=="SpatialCollections") {
+          ##check for ring objects if present error out
+          if (!is.null(gIntersection(sppolygons[u],sppolygons[j])@polyobj)&!is.null(gIntersection(sppolygons[u],sppolygons[j])@ringobj)) {
+            stop("Ring object")
+          }
+          ##if no ring objects
+          if (!is.null(gIntersection(sppolygons[u],sppolygons[j])@polyobj)&is.null(gIntersection(sppolygons[u],sppolygons[j])@ringobj)) {
+            ##check area of intersection is not zero for safety
+            if (area(gIntersection(sppolygons[u],sppolygons[j])@polyobj)!=0) {
+              print(paste(u,j))
+              ##see if polygons are internal to one another
+              if (!is.null(gDifference(sppolygons[u],sppolygons[j]))) {
+                if (area(gDifference(sppolygons[u],sppolygons[j]))!=0) {
+                  marker1<-1
+                }
+              }
+              if (!is.null(gDifference(sppolygons[j],sppolygons[u]))) {
+                if (area(gDifference(sppolygons[j],sppolygons[u]))!=0) {
+                  marker2<-1
+                }
+              }
+              ##if implied equal
+              if (marker1==0&marker2==0) {
+                ##take the intersection
+                temp1<-gIntersection(sppolygons[u],sppolygons[j])@polyobj
+                ##record the areas
+                area1<-area(sppolygons[u])
+                area2<-area(sppolygons[j])
+                ##initialise object for new probabilities
+                workingprob1<-rep(NA,length(temp1@polygons[[1]]@Polygons))
+                
+                ##initialise object for new polygons
+                bindingpolygons1<-list()
+                ##save new polygons and correct probability
+                for (q in 1:length(temp1@polygons[[1]]@Polygons)) {
+                  workingprob1[q]<-prob[u]*(temp1@polygons[[1]]@Polygons[[q]]@area/area1)+prob[j]*(temp1@polygons[[1]]@Polygons[[q]]@area/area2)
+                  bindingpolygons1[[q]]<-Polygons(list(temp1@polygons[[1]]@Polygons[[q]]),q)
+                }
+                bindingpolygons1<-SpatialPolygons(bindingpolygons1)
+                proj4string(bindingpolygons1)<-proj
+                
+                ##add probability to the list and remove original probabilities
+                prob<-c(prob,workingprob1)
+                prob<-prob[-c(u,j)]
+                
+                ##add polygon to the list and remove original polygons
+                sppolygons<-c(sppolygons,bindingpolygons1)
+                sppolygons<-do.call(bind, sppolygons)
+                sppolygons<-SpatialPolygonsDataFrame(sppolygons,data.frame(q=c(1:length(sppolygons)),match.ID = F))
+                print(nrow(sppolygons))
+                sppolygons<-sppolygons[-c(u,j),]
+                print(nrow(sppolygons))
+                sppolygons<-SpatialPolygons(sppolygons@polygons,proj4string=sppolygons@proj4string)
+                
+                ##reset pointer as polygon at i now different
+                u<-u-1
+              }
+              
+              ##polygon validity checking
+              
+              ##find any polygons with invalid geometries
+              valid<-rep(T,length(sppolygons))
+              for (m in 1:length(sppolygons)) {
+                if (!gIsValid(sppolygons[m])) {
+                  ##if invalid, attempt to fix by using st_make_valid
+                  sppolygons@polygons[m]<-as(st_make_valid(st_as_sf(sppolygons[m])), "Spatial")@polygons
+                  ##if still invalid enter error routine
+                  if (!gIsValid(sppolygons[m])) {
+                    valid[m]<-F
+                    print("Invalid geometry detected")
+                  }
+                }
+              }
+              
+              ##remove polygons with invalid geometries
+              sppolygons<-SpatialPolygonsDataFrame(sppolygons,data.frame(q=c(1:length(sppolygons))),match.ID = F)
+              sppolygons<-sppolygons[valid,]
+              sppolygons<-SpatialPolygons(sppolygons@polygons,proj4string=sppolygons@proj4string)
+              
+              ##remove probabilites of polygons with invalid geometries and record lost probability
+              lostprobability<-lostprobability+sum(prob[!valid])
+              prob<-prob[valid]
+              
+              ##break to next level
+              break()
+            }
+          }
         }
-        ##if no ring objects
-        if (!is.null(gIntersection(sppolygons[i],sppolygons[j])@polyobj)&is.null(gIntersection(sppolygons[i],sppolygons[j])@ringobj)) {
+        ##if the intersection is just a polygon
+        if (class(gIntersection(sppolygons[u],sppolygons[j]))=="SpatialPolygons") {
           ##check area of intersection is not zero for safety
-          if (area(gIntersection(sppolygons[i],sppolygons[j])@polyobj)!=0) {
-            print(paste(i,j))
+          if (area(gIntersection(sppolygons[u],sppolygons[j]))!=0) {
+            print(paste(u,j))
             ##see if polygons are internal to one another
-            if (!is.null(gDifference(sppolygons[i],sppolygons[j]))) {
-              if (area(gDifference(sppolygons[i],sppolygons[j]))!=0) {
+            if (!is.null(gDifference(sppolygons[u],sppolygons[j]))) {
+              if (area(gDifference(sppolygons[u],sppolygons[j]))!=0) {
                 marker1<-1
               }
-            }
-            if (!is.null(gDifference(sppolygons[j],sppolygons[i]))) {
-              if (area(gDifference(sppolygons[j],sppolygons[i]))!=0) {
+            }  
+            if (!is.null(gDifference(sppolygons[j],sppolygons[u]))) {
+              if (area(gDifference(sppolygons[j],sppolygons[u]))!=0) {
                 marker2<-1
               }
             }
             ##if implied equal
             if (marker1==0&marker2==0) {
               ##take the intersection
-              temp1<-gIntersection(sppolygons[i],sppolygons[j])@polyobj
+              temp1<-gIntersection(sppolygons[u],sppolygons[j])
               ##record the areas
-              area1<-area(sppolygons[i])
+              area1<-area(sppolygons[u])
               area2<-area(sppolygons[j])
               ##initialise object for new probabilities
               workingprob1<-rep(NA,length(temp1@polygons[[1]]@Polygons))
@@ -280,7 +393,7 @@ while(i<length(sppolygons)) {
               bindingpolygons1<-list()
               ##save new polygons and correct probability
               for (q in 1:length(temp1@polygons[[1]]@Polygons)) {
-                workingprob1[q]<-prob[i]*(temp1@polygons[[1]]@Polygons[[q]]@area/area1)+prob[j]*(temp1@polygons[[1]]@Polygons[[q]]@area/area2)
+                workingprob1[q]<-prob[u]*(temp1@polygons[[1]]@Polygons[[q]]@area/area1)+prob[j]*(temp1@polygons[[1]]@Polygons[[q]]@area/area2)
                 bindingpolygons1[[q]]<-Polygons(list(temp1@polygons[[1]]@Polygons[[q]]),q)
               }
               bindingpolygons1<-SpatialPolygons(bindingpolygons1)
@@ -288,30 +401,34 @@ while(i<length(sppolygons)) {
               
               ##add probability to the list and remove original probabilities
               prob<-c(prob,workingprob1)
-              prob<-prob[-c(i,j)]
+              prob<-prob[-c(u,j)]
               
               ##add polygon to the list and remove original polygons
               sppolygons<-c(sppolygons,bindingpolygons1)
               sppolygons<-do.call(bind, sppolygons)
               sppolygons<-SpatialPolygonsDataFrame(sppolygons,data.frame(q=c(1:length(sppolygons)),match.ID = F))
               print(nrow(sppolygons))
-              sppolygons<-sppolygons[-c(i,j),]
+              sppolygons<-sppolygons[-c(u,j),]
               print(nrow(sppolygons))
               sppolygons<-SpatialPolygons(sppolygons@polygons,proj4string=sppolygons@proj4string)
               
               ##reset pointer as polygon at i now different
-              i<-i-1
+              u<-u-1
             }
             
             ##polygon validity checking
             
             ##find any polygons with invalid geometries
-            ######very very hacky - change
             valid<-rep(T,length(sppolygons))
             for (m in 1:length(sppolygons)) {
               if (!gIsValid(sppolygons[m])) {
-                valid[m]<-F
-                print("Invalid geometry detected")
+                ##if invalid, attempt to fix by using st_make_valid
+                sppolygons@polygons[m]<-as(st_make_valid(st_as_sf(sppolygons[m])), "Spatial")@polygons
+                ##if still invalid enter error routine
+                if (!gIsValid(sppolygons[m])) {
+                  valid[m]<-F
+                  print("Invalid geometry detected")
+                }
               }
             }
             
@@ -329,116 +446,63 @@ while(i<length(sppolygons)) {
           }
         }
       }
-      ##if the intersection is just a polygon
-      if (class(gIntersection(sppolygons[i],sppolygons[j]))=="SpatialPolygons") {
-        ##check area of intersection is not zero for safety
-        if (area(gIntersection(sppolygons[i],sppolygons[j]))!=0) {
-          print(paste(i,j))
-          ##see if polygons are internal to one another
-          if (!is.null(gDifference(sppolygons[i],sppolygons[j]))) {
-            if (area(gDifference(sppolygons[i],sppolygons[j]))!=0) {
-              marker1<-1
-            }
-          }  
-          if (!is.null(gDifference(sppolygons[j],sppolygons[i]))) {
-            if (area(gDifference(sppolygons[j],sppolygons[i]))!=0) {
-              marker2<-1
-            }
-          }
-          ##if implied equal
-          if (marker1==0&marker2==0) {
-            ##take the intersection
-            temp1<-gIntersection(sppolygons[i],sppolygons[j])
-            ##record the areas
-            area1<-area(sppolygons[i])
-            area2<-area(sppolygons[j])
-            ##initialise object for new probabilities
-            workingprob1<-rep(NA,length(temp1@polygons[[1]]@Polygons))
-            
-            ##initialise object for new polygons
-            bindingpolygons1<-list()
-            ##save new polygons and correct probability
-            for (q in 1:length(temp1@polygons[[1]]@Polygons)) {
-              workingprob1[q]<-prob[i]*(temp1@polygons[[1]]@Polygons[[q]]@area/area1)+prob[j]*(temp1@polygons[[1]]@Polygons[[q]]@area/area2)
-              bindingpolygons1[[q]]<-Polygons(list(temp1@polygons[[1]]@Polygons[[q]]),q)
-            }
-            bindingpolygons1<-SpatialPolygons(bindingpolygons1)
-            proj4string(bindingpolygons1)<-proj
-            
-            ##add probability to the list and remove original probabilities
-            prob<-c(prob,workingprob1)
-            prob<-prob[-c(i,j)]
-            
-            ##add polygon to the list and remove original polygons
-            sppolygons<-c(sppolygons,bindingpolygons1)
-            sppolygons<-do.call(bind, sppolygons)
-            sppolygons<-SpatialPolygonsDataFrame(sppolygons,data.frame(q=c(1:length(sppolygons)),match.ID = F))
-            print(nrow(sppolygons))
-            sppolygons<-sppolygons[-c(i,j),]
-            print(nrow(sppolygons))
-            sppolygons<-SpatialPolygons(sppolygons@polygons,proj4string=sppolygons@proj4string)
-            
-            ##reset pointer as polygon at i now different
-            i<-i-1
-          }
-          
-          ##polygon validity checking
-          
-          ##find any polygons with invalid geometries
-          ######very very hacky - change
-          valid<-rep(T,length(sppolygons))
-          for (m in 1:length(sppolygons)) {
-            if (!gIsValid(sppolygons[m])) {
-              valid[m]<-F
-              print("Invalid geometry detected")
-            }
-          }
-          
-          ##remove polygons with invalid geometries
-          sppolygons<-SpatialPolygonsDataFrame(sppolygons,data.frame(q=c(1:length(sppolygons))),match.ID = F)
-          sppolygons<-sppolygons[valid,]
-          sppolygons<-SpatialPolygons(sppolygons@polygons,proj4string=sppolygons@proj4string)
-          
-          ##remove probabilites of polygons with invalid geometries and record lost probability
-          lostprobability<-lostprobability+sum(prob[!valid])
-          prob<-prob[valid]
-          
-          ##break to next level
-          break()
-        }
-      }
     }
+    ##reset markers and update pointer
+    marker1<-0
+    marker2<-0
+    u<-u+1
   }
-  ##reset markers and update pointer
-  marker1<-0
-  marker2<-0
-  i<-i+1
+  
+  ##change to equal area CRS - depends on input region
+  sppolygons<-spTransform(sppolygons,eqproj)
+  
+  #convert to sf object
+  sfpolygons<-st_make_valid(st_as_sf(sppolygons))
+  
+  ##take intersection of all polygons with themselves and filter out results with 0 area
+  sfintersection<-st_intersection(sfpolygons)
+  sfintersection<-sfintersection[as.numeric(st_area(sfintersection))!=0,]
+  sfintersection<-recursivesimplify(sfintersection)
+  
+  ##initialise object for final probabilities
+  newprob<-rep(NA,nrow(sfintersection))
+  
+  ##record areas for probability calculation
+  areasoriginal<-as.numeric(st_area(sfpolygons))
+  areasfinal<-as.numeric(st_area(sfintersection))
+  
+  ##calculate correct final probabilities
+  for (h in 1:nrow(sfintersection)) {
+    origins<-sfintersection$origins[h][[1]]
+    newprob[h]<-sum(prob[origins]*areasfinal[h]/areasoriginal[origins])
+  }
+  
+  sfintersection$Prob<-newprob
+  
+  sfintersection<-st_transform(sfintersection,4326,check=T)[,c(3,4)]
+  
+  if (lostprobability>0) {
+    stop(paste("Lost probability at iteration ",i,".",sep = ""))
+  }
+  ##generate KML - modification of Simon's code
+  
+  sink(file=paste("~/Desktop/TestKMLs/",seqinfo$Sequence[i],".kml",sep=""))
+  cat("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"); cat("\n")
+  cat("<kml xmlns=\"http://earth.google.com/kml/2.2\">"); cat("\n")
+  for (i in 1:nrow(sfintersection)) {
+    cat(paste("\t<polygon id=\"",paste(seqinfo$Sequence[i],i,sep="_"),"\" samplingProbability=\"",sfintersection$Prob[i],"\">",sep="")); cat("\n")
+    cat("\t\t<coordinates>"); cat("\n")
+    for (j in 1:nrow(sfintersection[i,1]$geometry[[1]][1][[1]])) {
+      cat(paste("\t\t\t",sfintersection[i,1]$geometry[[1]][1][[1]][j,2],",",sfintersection[i,1]$geometry[[1]][1][[1]][j,1],",0",sep="")); cat("\n")
+    }
+    cat("\t\t</coordinates>"); cat("\n")
+    cat("\t</polygon>"); cat("\n")
+  }
+  cat("</kml>"); cat("\n")
+  sink(NULL)
+  } else {
+    sink(file=paste("~/Desktop/TestKMLs/",seqinfo$Sequence[i],".kml",sep=""))
+    cat("No cases consistent with this metadata."); cat("\n")
+    sink(NULL)
+  }
 }
-
-##change to equal area CRS - depends on input region
-proj<-CRS("+proj=lcc +lat_1=49.83333333333334 +lat_2=51.16666666666666 +lat_0=50.797815 +lon_0=4.359215833333333 +x_0=649328 +y_0=665262 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs")
-
-sppolygons<-spTransform(sppolygons,proj)
-
-##for testing purposes keep a record to minimise reruns
-fortesting<-sppolygons
-sppolygons<-fortesting
-
-#convert to sf object
-sfpolygons<-st_make_valid(st_as_sf(sppolygons))
-
-##take intersection of all polygons with themselves and filter out results with 0 area
-sfintersection<-st_intersection(sfpolygons)
-sfintersection<-sfintersection[as.numeric(st_area(sfintersection))!=0,]
-sfintersection<-recursivesimplify(sfintersection)
-
-##initialise object for final probabilities
-newprob<-rep(NA,nrow(sfintersection))
-areasoriginal<-as.numeric(st_area(sfpolygons))
-areasfinal<-as.numeric(st_area(sfintersection))
-
-for (i in 1:nrow(sfintersection)) {
-  origins<-sfintersection$origins[i][[1]]
-  newprob[i]<-sum(prob[origins]*areasfinal[i]/areasoriginal[origins])
-}
-
